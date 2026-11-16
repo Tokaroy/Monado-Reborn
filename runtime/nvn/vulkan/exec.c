@@ -5026,6 +5026,22 @@ int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now
     }
     return changed;
 }
+// [XCDE] issue #25 (xsh_sweep): as vk_pages_changed, for ranges the GPU writes too (a mirror's): did the CPU write any
+// page of [addr, addr + size) since generation `since`? GPU writes into the imported heap don't set the OS bits, so a
+// page seen written here was written by the game. 1: yes, 0: no, -1: unknown (no tracking).
+static int pages_cpu_written(uint64_t addr, uint64_t size, uint32_t since) {
+    if (!size || addr < HEAP_BASE || addr - HEAP_BASE + size > HEAP_MAX || !pt_init()) return -1;
+    uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
+    static uint64_t pages[4096];
+    uint64_t pg = VC_PAGE;
+    int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
+    if (n < 0) return -1;
+    uint32_t g = ++vc_gen;
+    if (n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g;
+    else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - HEAP_BASE) / VC_PAGE] = g;
+    for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) if (vc_page_gen[p] > since) return 1;
+    return 0;
+}
 
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
@@ -5208,10 +5224,38 @@ static uint64_t audit_fs(void);
 // [XCDE] T197: ranges written by storing shaders (the vertex-stage skinning / cloth writers, compute) that draws then
 // read as vertex data get the same mirrors: an in-place read of a GPU-written range is noted, and from the next storing
 // draw / dispatch that binds it on, each such store refreshes the mirror whole after the draw. XCDE_STORE_SHADOW=0: off.
-typedef struct { uint64_t base, size; VkBuffer buf; VmaAllocation mem; bool sb; } XfbShadow;
+// [XCDE] issue #25 (models break / textures jump after ~40 min, then the frame rate sinks): mirrors only went away when
+// a newer mirror overlapped them. A writer that stopped (its scene left, its scratch memory handed to other data) left
+// its mirror behind, and every vertex / index read in that range kept getting the old copy - read before the vertex
+// cache, the heap's current bytes never reached the draw. And at NXSH live mirrors new writers got none (read over
+// PCIe: the slow decline). Now a mirror records when its contents were last copied in (wframe, wgen); once per frame
+// xsh_sweep retires the mirrors whose writer has gone quiet and whose pages the CPU wrote since (stale), or that went
+// unwritten for XSH_IDLE frames; a full table evicts the one written longest ago. Reads in a retired range go to the
+// heap (always current), and the writer's next capture makes a new mirror. XCDE_XFB_SHADOW_AGE=0: as before.
+typedef struct { uint64_t base, size; VkBuffer buf; VmaAllocation mem; bool sb; uint64_t wframe; uint32_t wgen; } XfbShadow;
 #define NXSH 64
+#define XSH_IDLE 600  // frames (~10 s at 60 fps) without a capture before a mirror is dropped
 static XfbShadow xsh[NXSH];
 static int nxsh;
+static uint64_t xsh_n_stale, xsh_n_idle, xsh_n_evicted, xsh_n_made;  // (diagnostics: the log shows them at powers of two)
+static bool xsh_age_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("XCDE_XFB_SHADOW_AGE"); on = !(e && *e == '0'); }
+    return on;
+}
+static void xsh_count(uint64_t *c, const char *what) {
+    if ((++*c & (*c - 1)) == 0)
+        LOG("[vk] mirrors %s: %llu (live %d; made %llu, stale %llu, idle %llu, evicted %llu)\n", what, (unsigned long long)*c,
+            nxsh, (unsigned long long)xsh_n_made, (unsigned long long)xsh_n_stale, (unsigned long long)xsh_n_idle,
+            (unsigned long long)xsh_n_evicted);
+}
+static void xsh_drop(int k) {  // (its buffer freed once the submissions that may read it are done)
+    XfbShadow *o = &xsh[k];
+    if (vc_ndead == VC_DEAD) { vk_wait_seq(vk_pending_seq() - 1); vc_free_dead(false); }
+    if (vc_ndead < VC_DEAD) { vc_dead[vc_ndead].b = o->buf; vc_dead[vc_ndead].m = o->mem; vc_dead[vc_ndead++].seq = vk_pending_seq(); }
+    xsh[k] = xsh[--nxsh];
+}
+static int pages_cpu_written(uint64_t addr, uint64_t size, uint32_t since);
 static bool xsh_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -5230,29 +5274,70 @@ static void xsh_copy(XfbShadow *s, VkCommandBuffer cb, uint64_t at, uint64_t n) 
     VkBufferCopy c = {at - HEAP_BASE, at - s->base, n};
     vkCmdCopyBuffer(cb, gmem_buf, s->buf, 1, &c);
     vk_full_barrier(cb);  // (the next readers see it)
+    s->wframe = renderer_present_count();
+    s->wgen = vc_gen;  // (CPU writes stamped after this generation are newer than the copy)
+}
+// [XCDE] issue #25: once per frame (first vertex / index read of it, or a new mirror): drop the mirrors that can no
+// longer be trusted or are not used. One being captured every frame is current by construction and not checked.
+static void xsh_sweep(void) {
+    static uint64_t last = ~0ull;
+    uint64_t now = renderer_present_count();
+    if (now == last || !xsh_age_on()) return;
+    last = now;
+    for (int k = 0; k < nxsh;) {
+        XfbShadow *o = &xsh[k];
+        if (o->wframe + 2 > now) { k++; continue; }  // (captured this frame or the last)
+        if (o->wframe + XSH_IDLE <= now) { xsh_drop(k); xsh_count(&xsh_n_idle, "dropped idle"); continue; }
+        if (pages_cpu_written(o->base, o->size, o->wgen) == 1) {
+            static int nl;
+            if (nl++ < 40) LOG("[vk] mirror %llx +%llu stale (the CPU rewrote its range %llu frames after its last capture)\n",
+                               (unsigned long long)o->base, (unsigned long long)o->size, (unsigned long long)(now - o->wframe));
+            xsh_drop(k);
+            xsh_count(&xsh_n_stale, "stale");
+            continue;
+        }
+        k++;
+    }
 }
 static void xsh_retire_overlaps(uint64_t a, uint64_t sz);
-// after a transform-feedback writer draw (its pass ended): [at, at + n) of the buffer [base, base + size) was written
-static void xsh_written(uint64_t base, uint64_t size, uint64_t at, uint64_t n) {
-    if (!xsh_on() || !gmem_buf || !n || base < HEAP_BASE || base + size > HEAP_BASE + gmem_size) return;
+// after a transform-feedback writer draw (its pass ended): [at, at + n) of the buffer [base, base + size) was written.
+// Returns the mirror when this call made it (NULL: it existed, or none could be made).
+static XfbShadow *xsh_written(uint64_t base, uint64_t size, uint64_t at, uint64_t n) {
+    if (!xsh_on() || !gmem_buf || !n || base < HEAP_BASE || base + size > HEAP_BASE + gmem_size) return NULL;
     XfbShadow *s = NULL;
     for (int i = 0; i < nxsh; i++) if (xsh[i].base == base && xsh[i].size == size) s = &xsh[i];
     VkCommandBuffer cb = vk_cmd();
     if (!s) {
         xsh_retire_overlaps(base, size);  // [XCDE] T205 (redo): a transform-feedback mirror too (see xsh_retire_overlaps)
-        if (nxsh == NXSH) return;
+        xsh_sweep();  // [XCDE] issue #25
+        if (nxsh == NXSH) {
+            // [XCDE] issue #25: full - the mirror captured longest ago goes (it returned here before: this writer got
+            // no mirror for the rest of the run and its readers fetched over PCIe)
+            if (!xsh_age_on()) return NULL;
+            int old = 0;
+            for (int k = 1; k < nxsh; k++) if (xsh[k].wframe < xsh[old].wframe) old = k;
+            xsh_drop(old);
+            xsh_count(&xsh_n_evicted, "evicted (table full)");
+        }
         s = &xsh[nxsh];
+        memset(s, 0, sizeof *s);  // (the slot may hold a dropped mirror's fields: sb)
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
                                  .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &s->buf, &s->mem, NULL) != VK_SUCCESS) return;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &s->buf, &s->mem, NULL) != VK_SUCCESS) return NULL;
         s->base = base; s->size = size;
         nxsh++;
         xsh_copy(s, cb, base, size);  // (whole: parts not written this frame hold what the heap holds)
-        LOG("[vk] transform feedback mirror %llx +%llu in device memory\n", (unsigned long long)base, (unsigned long long)size);
+        static int nl;  // (issue #25: dropped mirrors are made again by their writer's next capture - keep the log short)
+        if (nl++ < 100) LOG("[vk] transform feedback mirror %llx +%llu in device memory\n", (unsigned long long)base, (unsigned long long)size);
+        xsh_count(&xsh_n_made, "made");
+        if (at + n > base + size) n = base + size - at;
+        xsh_copy(s, cb, at, n);
+        return s;
     }
     if (at + n > base + size) n = base + size - at;
     xsh_copy(s, cb, at, n);
+    return NULL;
 }
 
 static uint64_t xsh_want[32];  // (T197) addresses of in-place vertex reads of GPU-written pages
@@ -5279,9 +5364,7 @@ static void xsh_retire_overlaps(uint64_t a, uint64_t sz) {
         static int nlog;
         if (nlog++ < 40) LOG("[vk] mirror %llx +%llu retired (overlapped by %llx +%llu)\n", (unsigned long long)o->base,
                              (unsigned long long)o->size, (unsigned long long)a, (unsigned long long)sz);
-        if (vc_ndead == VC_DEAD) { vk_wait_seq(vk_pending_seq() - 1); vc_free_dead(false); }
-        if (vc_ndead < VC_DEAD) { vc_dead[vc_ndead].b = o->buf; vc_dead[vc_ndead].m = o->mem; vc_dead[vc_ndead++].seq = vk_pending_seq(); }
-        xsh[k] = xsh[--nxsh];
+        xsh_drop(k);
     }
 }
 
@@ -5324,9 +5407,8 @@ static void xsh_stored(int stage) {
             for (int k = 0; k < nwant; k++) want |= xsh_want[k] >= a && xsh_want[k] < a + sz;
             if (!want) continue;
             xsh_retire_overlaps(a, sz);
-            int n0 = nxsh;
-            xsh_written(a, sz, a, sz);
-            if (nxsh > n0) xsh[n0].sb = true;
+            XfbShadow *made = xsh_written(a, sz, a, sz);  // (issue #25: it may sweep / evict - entries move)
+            if (made) made->sb = true;
             continue;
         }
         xsh_copy(s, vk_cmd(), a, sz);
@@ -5354,12 +5436,16 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     g_direct_limit = ~0ull;
+    if (nxsh) xsh_sweep();  // [XCDE] issue #25 (once per frame)
     if (nxsh) { XfbShadow *s = xsh_find(addr, size); if (s) { *buf = s->buf; *off = addr - s->base; g_direct_limit = s->base + s->size - addr; return true; } }  // (T175)
     if (vcache_lookup(addr, size, buf, off)) return true;
-    if (pt_state == 1 && nwant < 32 && vc_page_gpu[(addr - HEAP_BASE) / VC_PAGE] && xsh_store_on()) {  // (T197)
+    if (pt_state == 1 && vc_page_gpu[(addr - HEAP_BASE) / VC_PAGE] && xsh_store_on()) {  // (T197)
         bool k = false;
         for (int i = 0; i < nwant; i++) k |= xsh_want[i] == addr;
-        if (!k) xsh_want[nwant++] = addr;
+        // [XCDE] issue #25: a ring - the first 32 addresses of the run were kept for good before, and every GPU-written
+        // range read after that (later areas' skinning / cloth writers) never got a mirror
+        static unsigned wpos;
+        if (!k) { if (nwant < 32) xsh_want[nwant++] = addr; else xsh_want[wpos++ & 31] = addr; }
     }
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
